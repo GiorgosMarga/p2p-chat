@@ -122,7 +122,10 @@ impl Node {
             let msg_buf = match read_framed_bytes(&mut stream).await {
                 Ok(msg) => msg,
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
-                Err(err) => return Err(err),
+                Err(err) => {
+                    self.remove_peer(&peer_address).await;
+                    return Err(err);
+                }
             };
             let packet_received = messages::Packet::try_from(msg_buf.as_slice())
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}")))?;
@@ -174,13 +177,17 @@ impl Node {
                     Packet::Agreement(_, _) => {
                         let peers = {
                             let peers = self.peers.lock().await;
-                            peers.values().cloned().collect::<Vec<_>>()
+                            peers
+                                .iter()
+                                .map(|(addr, stream)| (addr.clone(), Arc::clone(stream)))
+                                .collect::<Vec<_>>()
                         };
 
-                        for stream in peers {
+                        for (peer_addr, stream) in peers {
                             let mut stream = stream.lock().await;
                             if let Err(err) = self.send_packet(&mut stream, &packet_to_send).await {
                                 eprintln!("{err}");
+                                self.remove_peer(&peer_addr).await;
                             }
                         }
                     }
@@ -193,7 +200,8 @@ impl Node {
                         if let Some(stream) = peer {
                             let mut stream = stream.lock().await;
                             if let Err(err) = self.send_packet(&mut stream, &packet_to_send).await {
-                                eprintln!("{err}");
+                                self.remove_peer(&peer_address).await;
+                                return Err(err);
                             }
                         };
                     }
@@ -201,9 +209,13 @@ impl Node {
             }
         }
 
+        self.remove_peer(&peer_address).await;
         stream.shutdown().await
     }
 
+    async fn remove_peer(&self, peer_addr: &str) {
+        self.peers.lock().await.remove(peer_addr);
+    }
     async fn apply_agreement(&self, message_id: MessageId, final_seq: u64) {
         if let Some(old_seq) = self.msg_idx.lock().await.remove(&message_id) {
             {
@@ -247,13 +259,17 @@ impl Node {
         let packet = Packet::ProposalRequest(msg_id, msg_buf);
         let peers = {
             let peers = self.peers.lock().await;
-            peers.values().cloned().collect::<Vec<_>>()
+            peers
+                .iter()
+                .map(|(addr, stream)| (addr.clone(), Arc::clone(stream)))
+                .collect::<Vec<_>>()
         };
 
-        for stream in peers {
+        for (peer_addr, stream) in peers {
             let mut stream = stream.lock().await;
             if let Err(err) = self.send_packet(&mut stream, &packet).await {
                 eprintln!("{err}");
+                self.remove_peer(&peer_addr).await;
             }
         }
         Ok(())
@@ -275,17 +291,26 @@ impl Node {
         let mut interval = tokio::time::interval(Duration::from_secs(1));
         loop {
             interval.tick().await;
-            let peers: Vec<_> = { self.peers.lock().await.values().cloned().collect() };
-            for peer in peers {
+            let peers: Vec<_> = {
+                let peers = self.peers.lock().await;
+                peers
+                    .iter()
+                    .map(|(addr, stream)| (addr.clone(), Arc::clone(stream)))
+                    .collect()
+            };
+            for (peer_addr, peer) in peers {
                 let mut stream = peer.lock().await;
                 let buf: Vec<u8> = Packet::Ping().into();
                 match stream.write_u32_le(buf.len() as u32).await {
                     Ok(_) => {
-                        stream.write_all(&buf).await;
+                        if let Err(err) = stream.write_all(&buf).await {
+                            eprintln!("{err}");
+                            self.remove_peer(&peer_addr).await;
+                        }
                     }
                     Err(err) => {
                         eprintln!("{err}");
-                        // remove peer
+                        self.remove_peer(&peer_addr).await;
                     }
                 }
             }
