@@ -1,6 +1,10 @@
+use rand::random;
+use std::fmt::format;
+use std::time::Duration;
 use std::{env::args, sync::Arc};
-use tokio::io;
-use tokio::time::sleep;
+use tokio::fs::File;
+use tokio::io::{self, AsyncBufReadExt};
+use tokio::time::{self, sleep};
 
 mod messages;
 mod server;
@@ -21,16 +25,26 @@ async fn main() -> io::Result<()> {
     let _ = server.clone().start().await?;
 
     if let Some(peer_address) = peer_address {
-        server.connect(peer_address).await?;
-        sleep(std::time::Duration::from_secs(1)).await;
-        for i in 0..=5 {
-            server
-                .send_message(peer_address, &format!("hello_msg {}", i))
-                .await?;
-            // sleep(std::time::Duration::from_secs(1)).await;
+        let addresses = peer_address.split(",");
+        for address in addresses {
+            server.connect(address).await.expect("cant connect with");
         }
     }
+    tokio::time::sleep(Duration::from_secs(15)).await;
+
     let _consumer = tokio::spawn(server.clone().consume_messages());
+    let _heartbeat = tokio::spawn(server.clone().heartbeat_loop());
+    let dummy_word = format!("node{}.txt", id);
+
+    let f = File::open(&dummy_word)
+        .await
+        .expect(&format!("file doesnt exist {}", dummy_word));
+    let mut lines = tokio::io::BufReader::new(f).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let sleep_duration: u8 = random();
+        time::sleep(Duration::from_secs((sleep_duration % 5) as u64)).await;
+        server.send_message(&line).await;
+    }
     let _ = tokio::signal::ctrl_c().await;
 
     Ok(())

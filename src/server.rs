@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     io::ErrorKind::InvalidInput,
     net::SocketAddr,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{
@@ -9,15 +10,17 @@ use std::{
             Ordering::{self, Relaxed},
         },
     },
+    time::Duration,
 };
 use tokio::{
     io::{self, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    stream,
     sync::{Mutex, Notify},
 };
 
 use crate::messages::{self, Message, MessageId, Packet};
-
+#[derive(Debug)]
 struct QueueEntry {
     is_deliverable: bool,
     msg: Vec<u8>,
@@ -121,7 +124,8 @@ impl Node {
                 Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => break,
                 Err(err) => return Err(err),
             };
-            let packet_received = messages::Packet::from(msg_buf);
+            let packet_received = messages::Packet::try_from(msg_buf.as_slice())
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{err:?}")))?;
             let packet_to_send: Option<Packet> = match packet_received {
                 messages::Packet::Agreement(message_id, final_seq) => {
                     self.apply_agreement(message_id, final_seq).await;
@@ -136,12 +140,11 @@ impl Node {
                         entry.0 = entry.0.max(proposed);
                         entry.1 += 1;
 
-                        *entry
+                        entry.1 as u64
                     };
-
-                    if count.1 == 2 {
-                        self.apply_agreement(message_id, count.0).await;
-                        Some(Packet::Agreement(message_id, count.0))
+                    if count == 3 {
+                        self.apply_agreement(message_id, count).await;
+                        Some(Packet::Agreement(message_id, count))
                     } else {
                         None
                     }
@@ -163,10 +166,37 @@ impl Node {
                     }
                     Some(Packet::ProposalReply(message_id, seq))
                 }
+                Packet::Ping() => Some(Packet::Pong()),
+                Packet::Pong() => None,
             };
             if let Some(packet_to_send) = packet_to_send {
-                if let Err(err) = self.send_packet(&peer_address, packet_to_send).await {
-                    eprintln!("{err}");
+                match packet_to_send {
+                    Packet::Agreement(_, _) => {
+                        let peers = {
+                            let peers = self.peers.lock().await;
+                            peers.values().cloned().collect::<Vec<_>>()
+                        };
+
+                        for stream in peers {
+                            let mut stream = stream.lock().await;
+                            if let Err(err) = self.send_packet(&mut stream, &packet_to_send).await {
+                                eprintln!("{err}");
+                            }
+                        }
+                    }
+                    _ => {
+                        let peer = {
+                            let peers = self.peers.lock().await;
+                            peers.get(&peer_address).cloned()
+                        };
+
+                        if let Some(stream) = peer {
+                            let mut stream = stream.lock().await;
+                            if let Err(err) = self.send_packet(&mut stream, &packet_to_send).await {
+                                eprintln!("{err}");
+                            }
+                        };
+                    }
                 }
             }
         }
@@ -179,6 +209,7 @@ impl Node {
             {
                 let mut queue = self.queue.lock().await;
                 let entry = queue.remove(&(old_seq, message_id)).unwrap();
+
                 queue.insert(
                     (final_seq, message_id),
                     QueueEntry {
@@ -191,7 +222,7 @@ impl Node {
             self.delivery_notify.notify_one();
         }
     }
-    pub async fn send_message(&self, to: &str, msg: &str) -> io::Result<()> {
+    pub async fn send_message(&self, msg: &str) -> io::Result<()> {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let msg_id = rand::random();
 
@@ -214,34 +245,49 @@ impl Node {
         }
 
         let packet = Packet::ProposalRequest(msg_id, msg_buf);
-        self.send_packet(to, packet).await
-    }
-
-    async fn send_packet(&self, to: &str, packet: messages::Packet) -> io::Result<()> {
-        let peer = {
-            let peers = self.peers.lock().await;
-            peers.get(to).cloned()
-        };
-
-        if let Some(stream) = peer {
-            let buf: Vec<u8> = packet.into();
-            let mut stream = stream.lock().await;
-            stream.write_u32_le(buf.len() as u32).await?;
-            stream.write_all(&buf).await?;
-        }
-
-        Ok(())
-    }
-    pub async fn broadcast(&self, msg: &[u8]) {
         let peers = {
             let peers = self.peers.lock().await;
             peers.values().cloned().collect::<Vec<_>>()
         };
 
-        for peer in peers {
-            let mut stream = peer.lock().await;
-            if let Err(e) = stream.write_all(msg).await {
-                eprintln!("{e}");
+        for stream in peers {
+            let mut stream = stream.lock().await;
+            if let Err(err) = self.send_packet(&mut stream, &packet).await {
+                eprintln!("{err}");
+            }
+        }
+        Ok(())
+    }
+
+    async fn send_packet(
+        &self,
+        stream: &mut TcpStream,
+        packet: &messages::Packet,
+    ) -> io::Result<()> {
+        let buf: Vec<u8> = packet.into();
+        stream.write_u32_le(buf.len() as u32).await?;
+        stream.write_all(&buf).await?;
+
+        Ok(())
+    }
+
+    pub async fn heartbeat_loop(self: Arc<Self>) -> ! {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            let peers: Vec<_> = { self.peers.lock().await.values().cloned().collect() };
+            for peer in peers {
+                let mut stream = peer.lock().await;
+                let buf: Vec<u8> = Packet::Ping().into();
+                match stream.write_u32_le(buf.len() as u32).await {
+                    Ok(_) => {
+                        stream.write_all(&buf).await;
+                    }
+                    Err(err) => {
+                        eprintln!("{err}");
+                        // remove peer
+                    }
+                }
             }
         }
     }
